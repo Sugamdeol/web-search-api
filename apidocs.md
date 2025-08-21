@@ -291,5 +291,3 @@ GET /mix
 * Gzip compression enabled
 * Responses <200ms for warm queries
 
-
-👉 Bata, isme aur ek **Quick Start (curl + JS fetch examples)** section bhi daal du kya?
