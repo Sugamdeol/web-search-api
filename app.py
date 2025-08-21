@@ -1,357 +1,213 @@
-# app.py
-from fastapi import FastAPI, Query, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from duckduckgo_search import DDGS
-import time
-import re
-from urllib.parse import urlparse
-from collections import defaultdict, deque
-from cachetools import TTLCache
-import asyncio
+from fastapi.responses import JSONResponse
+import requests, hashlib, time
+from bs4 import BeautifulSoup
+import concurrent.futures
 
-APP_NAME = "TurboDuck Search API"
+app = FastAPI(title="Free Search API", version="2.0")
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
-
-# CORS
+# ------------------ Middlewares ------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# gzip compression
-app.add_middleware(GZipMiddleware, minimum_size=500)
+# ------------------ In-memory cache ------------------
+cache = {}
+CACHE_TTL = 120  # seconds
 
-# simple in-memory TTL cache
-CACHE_TTL_SECONDS = int(60 * 30)  # 30 min
-CACHE_MAXSIZE = 10_000
-cache = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL_SECONDS)
 
-# basic token bucket rate limit per IP
-RATE_LIMIT = 60  # requests
-RATE_WINDOW = 60  # seconds
-_buckets = defaultdict(lambda: deque())
+def cache_key(endpoint, params):
+    raw = f"{endpoint}:{str(params)}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
-# ---------- helpers ----------
 
-def canon_url(u: str) -> str:
-    try:
-        p = urlparse(u)
-        clean = f"{p.scheme}://{p.netloc}{p.path}"
-        if clean.endswith('/'):
-            clean = clean[:-1]
-        return clean
-    except Exception:
-        return u
+def get_cached(endpoint, params):
+    key = cache_key(endpoint, params)
+    if key in cache:
+        val, ts = cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return val
+    return None
 
-def dedupe(items, key=lambda x: x):
-    seen = set()
-    out = []
-    for it in items:
-        k = key(it)
-        if k and k not in seen:
-            out.append(it)
-            seen.add(k)
+
+def set_cache(endpoint, params, data):
+    key = cache_key(endpoint, params)
+    cache[key] = (data, time.time())
+
+
+# ------------------ Helpers ------------------
+def fetch_json(url, params=None, headers=None):
+    headers = headers or {"User-Agent": "Mozilla/5.0"}
+    res = requests.get(url, params=params, headers=headers, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+
+# ------------------ Endpoints ------------------
+
+@app.get("/search")
+def search(
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(10, le=20, description="Number of results to return"),
+    site: str = Query(None, description="Restrict results to a site"),
+):
+    """
+    Search the web (DuckDuckGo as backend).
+    """
+    params = {"q": f"{q} site:{site}" if site else q, "format": "json", "no_redirect": 1}
+    cached = get_cached("search", params)
+    if cached:
+        return cached
+
+    url = "https://api.duckduckgo.com/"
+    data = fetch_json(url, params=params)
+
+    results = []
+    for item in data.get("RelatedTopics", [])[:limit]:
+        if "Text" in item and "FirstURL" in item:
+            results.append({
+                "title": item["Text"],
+                "url": item["FirstURL"]
+            })
+
+    out = {"query": q, "count": len(results), "results": results}
+    set_cache("search", params, out)
     return out
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
-def make_cache_key(route: str, params: dict):
-    parts = [route]
-    for k in sorted(params.keys()):
-        parts.append(f"{k}={params[k]}")
-    return "|".join(parts)
+@app.get("/news")
+def news(
+    q: str = Query(..., description="News search query"),
+    limit: int = Query(5, le=15)
+):
+    """
+    Fetch latest news results.
+    """
+    params = {"q": q, "format": "json", "no_redirect": 1}
+    cached = get_cached("news", params)
+    if cached:
+        return cached
 
-async def rate_limiter(request: Request):
-    ip = request.client.host if request.client else "0.0.0.0"
-    now = time.time()
-    q = _buckets[ip]
-    # purge old
-    while q and now - q[0] > RATE_WINDOW:
-        q.popleft()
-    if len(q) >= RATE_LIMIT:
-        raise HTTPException(429, detail="Too many requests, slow down")
-    q.append(now)
+    url = "https://api.duckduckgo.com/"
+    data = fetch_json(url, params=params)
 
-def parse_time_range(tr: Optional[str]):
-    if not tr:
-        return None
-    m = re.fullmatch(r"(\d+)([dwmy])", tr.strip())
-    if not m:
-        return None
-    n, unit = int(m.group(1)), m.group(2)
-    days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
-    return days
+    results = []
+    for item in data.get("RelatedTopics", [])[:limit]:
+        if "Text" in item and "FirstURL" in item:
+            results.append({
+                "title": item["Text"],
+                "url": item["FirstURL"]
+            })
 
-class SearchResponse(BaseModel):
-    query: str
-    count: int
-    page: int
-    per_page: int
-    results: list
-    took_ms: int
-    source: str = "duckduckgo"
+    out = {"query": q, "count": len(results), "results": results}
+    set_cache("news", params, out)
+    return out
 
-@app.middleware("http")
-async def _global_rate_limit(request: Request, call_next):
+
+@app.get("/images")
+def images(
+    q: str = Query(...),
+    limit: int = Query(5, le=15)
+):
+    """
+    Image search (via DuckDuckGo).
+    """
+    url = "https://duckduckgo.com/"
+    params = {"q": q}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        await rate_limiter(request)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
-    return await call_next(request)
+        token = requests.post(url, data=params, headers=headers).text
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to get token")
 
-@app.get("/")
-async def root():
-    return {
-        "name": APP_NAME,
-        "version": "1.1.0",
-        "routes": [
-            "/search", "/news", "/images", "/videos", "/suggest", "/mix",
-        ],
-        "docs": "/docs"
-    }
+    js_url = "https://duckduckgo.com/i.js"
+    res = requests.get(js_url, params={"q": q, "o": "json"}, headers=headers)
+    res.raise_for_status()
+    data = res.json()
 
-# ---------------- core search endpoints ----------------
+    results = []
+    for item in data.get("results", [])[:limit]:
+        results.append({
+            "title": item.get("title"),
+            "image": item.get("image"),
+            "url": item.get("url"),
+            "thumbnail": item.get("thumbnail")
+        })
 
-@app.get("/search", response_model=SearchResponse)
-async def search(q: str = Query(..., min_length=1),
-                 limit: int = Query(10, ge=1, le=50),
-                 page: int = Query(1, ge=1),
-                 region: Optional[str] = Query(None, description="like 'us-en' or 'in-en'"),
-                 safesearch: Optional[str] = Query("moderate", description="off, moderate, strict"),
-                 site: Optional[str] = Query(None, description="only this domain"),
-                 exclude_site: Optional[str] = Query(None, description="block this domain")):
-    t0 = time.time()
-    per_page = limit
-    params = {
-        "q": q, "limit": limit, "page": page,
-        "region": region or "", "safesearch": safesearch or "",
-        "site": site or "", "exclude_site": exclude_site or ""
-    }
-    key = make_cache_key("/search", params)
-    if key in cache:
-        data = cache[key]
-        data["took_ms"] = int((time.time() - t0) * 1000)
-        return data
+    return {"query": q, "count": len(results), "results": results}
 
-    query = q
-    if site:
-        query += f" site:{site}"
-    if exclude_site:
-        query += f" -site:{exclude_site}"
-
-    offset = (page - 1) * per_page
-    raw = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, region=region, safesearch=safesearch, max_results=offset + per_page):
-            raw.append({
-                "title": r.get("title"),
-                "url": r.get("href"),
-                "snippet": r.get("body"),
-                "source": urlparse(r.get("href", "")).netloc if r.get("href") else None
-            })
-
-    raw = dedupe(raw, key=lambda x: canon_url(x.get("url")))
-    page_items = raw[offset: offset + per_page]
-
-    resp = {
-        "query": q,
-        "count": len(page_items),
-        "page": page,
-        "per_page": per_page,
-        "results": page_items,
-        "took_ms": int((time.time() - t0) * 1000),
-        "source": "duckduckgo"
-    }
-    cache[key] = resp
-    return resp
-
-@app.get("/news", response_model=SearchResponse)
-async def news(q: str = Query(..., min_length=1),
-               limit: int = Query(10, ge=1, le=50),
-               page: int = Query(1, ge=1),
-               region: Optional[str] = None,
-               safesearch: Optional[str] = "moderate",
-               freshness: Optional[str] = Query(None, description="like 7d, 30d, 1y")):
-    t0 = time.time()
-    params = {"q": q, "limit": limit, "page": page, "region": region or "", "freshness": freshness or ""}
-    key = make_cache_key("/news", params)
-    if key in cache:
-        data = cache[key]
-        data["took_ms"] = int((time.time() - t0) * 1000)
-        return data
-
-    per_page = limit
-    offset = (page - 1) * per_page
-    timelimit = parse_time_range(freshness)
-
-    raw = []
-    with DDGS() as ddgs:
-        for r in ddgs.news(q, region=region, safesearch=safesearch, max_results=offset + per_page, timelimit=timelimit):
-            raw.append({
-                "title": r.get("title"),
-                "url": r.get("url"),
-                "published": r.get("date"),
-                "source": r.get("source")
-            })
-
-    raw = dedupe(raw, key=lambda x: canon_url(x.get("url")))
-    page_items = raw[offset: offset + per_page]
-
-    resp = {
-        "query": q,
-        "count": len(page_items),
-        "page": page,
-        "per_page": per_page,
-        "results": page_items,
-        "took_ms": int((time.time() - t0) * 1000),
-        "source": "duckduckgo"
-    }
-    cache[key] = resp
-    return resp
-
-@app.get("/images", response_model=SearchResponse)
-async def images(q: str = Query(..., min_length=1),
-                 limit: int = Query(10, ge=1, le=50),
-                 page: int = Query(1, ge=1),
-                 region: Optional[str] = None,
-                 safesearch: Optional[str] = "moderate",
-                 size: Optional[str] = Query(None, description="Small, Medium, Large, Wallpaper"),
-                 color: Optional[str] = Query(None, description="color filter like red, blue, mono")):
-    t0 = time.time()
-    params = {"q": q, "limit": limit, "page": page, "region": region or "", "size": size or "", "color": color or ""}
-    key = make_cache_key("/images", params)
-    if key in cache:
-        data = cache[key]
-        data["took_ms"] = int((time.time() - t0) * 1000)
-        return data
-
-    per_page = limit
-    offset = (page - 1) * per_page
-
-    raw = []
-    with DDGS() as ddgs:
-        for r in ddgs.images(q, region=region, safesearch=safesearch, size=size, color=color, max_results=offset + per_page):
-            raw.append({
-                "title": r.get("title"),
-                "image": r.get("image"),
-                "thumbnail": r.get("thumbnail"),
-                "source": r.get("source")
-            })
-
-    raw = dedupe(raw, key=lambda x: x.get("image"))
-    page_items = raw[offset: offset + per_page]
-
-    resp = {
-        "query": q,
-        "count": len(page_items),
-        "page": page,
-        "per_page": per_page,
-        "results": page_items,
-        "took_ms": int((time.time() - t0) * 1000),
-        "source": "duckduckgo"
-    }
-    cache[key] = resp
-    return resp
-
-@app.get("/videos", response_model=SearchResponse)
-async def videos(q: str = Query(..., min_length=1),
-                 limit: int = Query(10, ge=1, le=50),
-                 page: int = Query(1, ge=1),
-                 region: Optional[str] = None,
-                 safesearch: Optional[str] = "moderate"):
-    t0 = time.time()
-    params = {"q": q, "limit": limit, "page": page, "region": region or ""}
-    key = make_cache_key("/videos", params)
-    if key in cache:
-        data = cache[key]
-        data["took_ms"] = int((time.time() - t0) * 1000)
-        return data
-
-    per_page = limit
-    offset = (page - 1) * per_page
-
-    raw = []
-    with DDGS() as ddgs:
-        for r in ddgs.videos(q, region=region, safesearch=safesearch, max_results=offset + per_page):
-            raw.append({
-                "title": r.get("title"),
-                "url": r.get("content"),
-                "duration": r.get("duration"),
-                "publisher": r.get("publisher"),
-            })
-
-    raw = dedupe(raw, key=lambda x: canon_url(x.get("url")))
-    page_items = raw[offset: offset + per_page]
-
-    resp = {
-        "query": q,
-        "count": len(page_items),
-        "page": page,
-        "per_page": per_page,
-        "results": page_items,
-        "took_ms": int((time.time() - t0) * 1000),
-        "source": "duckduckgo"
-    }
-    cache[key] = resp
-    return resp
 
 @app.get("/suggest")
-async def suggest(q: str = Query(..., min_length=1), region: Optional[str] = None):
-    key = make_cache_key("/suggest", {"q": q, "region": region or ""})
-    if key in cache:
-        return cache[key]
-    out = []
-    with DDGS() as ddgs:
-        for s in ddgs.suggestions(q, region=region):
-            val = s.get("phrase") or s.get("value") or s.get("phrase")
-            if val:
-                out.append(val)
-    data = {"query": q, "suggestions": out[:20]}
-    cache[key] = data
-    return data
+def suggest(
+    q: str = Query(..., description="Get query suggestions")
+):
+    """
+    Fetch search suggestions.
+    """
+    url = "https://duckduckgo.com/ac/"
+    try:
+        res = requests.get(url, params={"q": q})
+        data = res.json()
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch suggestions")
+
+    suggestions = [s["phrase"] for s in data]
+    return {"query": q, "suggestions": suggestions}
+
 
 @app.get("/mix")
-async def mix(q: str = Query(..., min_length=1), limit: int = Query(5, ge=1, le=20)):
-    t0 = time.time()
-    async def _run(func, *args, **kwargs):
-        return await asyncio.to_thread(func, *args, **kwargs)
+def mix_search(
+    q: str = Query(..., description="Run search+news+images in parallel")
+):
+    """
+    Run multiple searches in parallel.
+    """
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {
+            "search": executor.submit(search, q, 5),
+            "news": executor.submit(news, q, 3),
+            "images": executor.submit(images, q, 3),
+        }
+        for key, f in futures.items():
+            try:
+                out[key] = f.result()
+            except Exception as e:
+                out[key] = {"error": str(e)}
+    return out
 
-    def s_text():
-        with DDGS() as ddgs:
-            return [
-                {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
-                for r in ddgs.text(q, max_results=limit)
-            ]
 
-    def s_news():
-        with DDGS() as ddgs:
-            return [
-                {"title": r.get("title"), "url": r.get("url"), "published": r.get("date"), "source": r.get("source")}
-                for r in ddgs.news(q, max_results=limit)
-            ]
+@app.get("/fetch")
+def fetch_content(
+    url: str = Query(..., description="Full URL of the page to fetch content from"),
+    text_only: bool = Query(True, description="If true, returns cleaned text only")
+):
+    """
+    Fetch and parse content from a given URL.
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; FastAPI-Scraper/2.0)"}
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching URL: {str(e)}")
 
-    def s_images():
-        with DDGS() as ddgs:
-            return [
-                {"title": r.get("title"), "image": r.get("image"), "thumbnail": r.get("thumbnail")}
-                for r in ddgs.images(q, max_results=limit)
-            ]
+    soup = BeautifulSoup(res.text, "html.parser")
 
-    text, news_res, images_res = await asyncio.gather(_run(s_text), _run(s_news), _run(s_images))
-
-    return {
-        "query": q,
-        "took_ms": int((time.time() - t0) * 1000),
-        "web": text,
-        "news": news_res,
-        "images": images_res,
+    data = {
+        "url": url,
+        "title": soup.title.string if soup.title else None,
+        "headings": [h.get_text(strip=True) for h in soup.find_all(["h1","h2","h3"])],
+        "links": [{"text": a.get_text(strip=True), "href": a.get("href")} for a in soup.find_all("a", href=True)]
     }
+
+    if text_only:
+        for s in soup(["script", "style", "noscript"]):
+            s.extract()
+        data["text"] = soup.get_text(" ", strip=True)
+
+    return data
