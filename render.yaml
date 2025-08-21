@@ -1,10 +1,9 @@
 services:
   - type: web
-    name: turboduck-api
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app:app --host 0.0.0.0 --port 10000"
+    name: free-search-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port 10000
     envVars:
-      - key: PORT
-        value: "10000"
+      - key: PYTHON_VERSION
+        value: 3.11
