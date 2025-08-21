@@ -1,4 +1,4 @@
 fastapi
-uvicorn[standard]
-duckduckgo-search
-cachetools
+uvicorn
+requests
+beautifulsoup4
