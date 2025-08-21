@@ -1,33 +1,77 @@
-# TurboDuck Search API
 
-A fast, free search API on Render using duckduckgo-search.
-Endpoints: `/search`, `/news`, `/images`, `/videos`, `/suggest`, `/mix`.
+# Free Search API 🚀
 
-## Deploy
-1. Push these files to a GitHub repo.
-2. Create a new Web Service on Render from the repo.
-3. Render will use `render.yaml` and deploy.
+A free, fast, feature-rich API for search, news, images, suggestions, and webpage content fetching.  
+Built with **FastAPI** and deployable on **Render**.
 
-## Usage examples
-- Web search  
-  `/search?q=ai tools&limit=10&page=1&region=in-en&safesearch=moderate&site=example.com`
+---
 
-- News  
-  `/news?q=india&freshness=7d`
+## Features
+- 🔍 `/search` → Web search
+- 📰 `/news` → News search
+- 🖼️ `/images` → Image search
+- 💡 `/suggest` → Search suggestions
+- ⚡ `/mix` → Parallel search (search+news+images)
+- 📑 `/fetch` → Fetch and parse webpage contents (title, headings, links, clean text)
 
-- Images  
-  `/images?q=virat kohli&size=Large&color=mono`
+---
 
-- Videos  
-  `/videos?q=funny memes`
+## Run Locally
+```bash
+pip install -r requirements.txt
+uvicorn app:app --reload
+````
 
-- Suggestions  
-  `/suggest?q=indi`
+Visit: `http://127.0.0.1:8000/docs`
 
-- Mixed (web + news + images)  
-  `/mix?q=iphone 16`
+---
 
-## Notes
-- Built-in gzip, CORS, caching, rate limit.
-- Pagination available by `page` and `limit`.
-- For production, replace in-memory cache with Redis and tighten rate limits.
+## Deploy on Render
+
+1. Push code to GitHub
+2. On Render → New Web Service → Connect repo
+3. Done! Your API is live 🎉
+
+---
+
+## Example Requests
+
+**Search**
+
+```
+GET /search?q=ai+tools&limit=5
+```
+
+**News**
+
+```
+GET /news?q=india
+```
+
+**Images**
+
+```
+GET /images?q=cat&limit=3
+```
+
+**Suggestions**
+
+```
+GET /suggest?q=machine
+```
+
+**Mix**
+
+```
+GET /mix?q=cricket
+```
+
+**Fetch Content**
+
+```
+GET /fetch?url=https://example.com&text_only=true
+```
+
+```
+
+
