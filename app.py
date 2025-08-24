@@ -27,17 +27,17 @@ class Settings(BaseSettings):
     USER_AGENT: str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36"
     TIMEOUT: int = 15
     MAX_RESULTS: int = 20
-    ALLOW_ORIGINS: List[str] = ["*"]  # change in prod
-    RATE_LIMIT: str = "60/minute"     # per IP
+    ALLOW_ORIGINS: List[str] = ["*"]  # Change in production
+    RATE_LIMIT: str = "60/minute"     # Per IP
     ENABLE_SITEMAP: bool = True
 
 settings = Settings()
 
 # ----------------------------
-# App
+# App Setup
 # ----------------------------
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="LLM Web Search API", version="1.0.0")
+app = FastAPI(title="LLM Web Search API", version="1.0.1")
 app.state.limiter = limiter
 
 app.add_middleware(
@@ -53,18 +53,18 @@ def ratelimit_handler(request: Request, exc: RateLimitExceeded):
     return HTTPException(status_code=429, detail="Rate limit hit. Chill for a bit bro")
 
 # ----------------------------
-# Models
+# Pydantic Models
 # ----------------------------
 class SearchParams(BaseModel):
-    q: str = Field(..., description="query")
+    q: str = Field(..., description="The search query")
     num: int = Field(10, ge=1, le=settings.MAX_RESULTS)
     lang: str = Field("en")
-    country: Optional[str] = Field(None, description="gl param like us in")
-    site: Optional[str] = Field(None, description="restrict to site")
-    safe: bool = Field(True, description="safe search hint")
-    tbs: Optional[str] = Field(None, description="time filter like qdr:d, qdr:w, qdr:m")
+    country: Optional[str] = Field(None, description="Country code like 'us' or 'in'")
+    site: Optional[str] = Field(None, description="Restrict search to a specific site")
+    safe: bool = Field(True, description="Enable safe search")
+    tbs: Optional[str] = Field(None, description="Time filter like qdr:d (day), qdr:w (week), qdr:m (month)")
     dedupe: bool = Field(True)
-    fetch_snippets: bool = Field(True, description="fetch each URL HTML title and meta description")
+    fetch_snippets: bool = Field(True, description="Fetch HTML title and meta description for each URL")
     parallel: int = Field(8, ge=1, le=16)
 
 class ExtractParams(BaseModel):
@@ -84,10 +84,10 @@ class BatchExtractParams(BaseModel):
 class YTParams(BaseModel):
     video_id: str
     languages: List[str] = Field(default_factory=lambda: ["en", "en-US", "hi"])
-    translate_to: Optional[str] = None  # like "en" or "hi"
+    translate_to: Optional[str] = None
 
 # ----------------------------
-# Utils
+# Core Utility Functions
 # ----------------------------
 def json_dumps(obj: Any) -> bytes:
     return orjson.dumps(obj, option=orjson.OPT_INDENT_2)
@@ -95,34 +95,25 @@ def json_dumps(obj: Any) -> bytes:
 HEADERS = {"User-Agent": settings.USER_AGENT}
 
 def clean_text(t: Optional[str]) -> Optional[str]:
-    if not t:
-        return t
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-@lru_cache(maxsize=2048)
-def _cache_key(url: str) -> str:
-    return url
+    if not t: return t
+    return re.sub(r"\s+", " ", t).strip()
 
 async def fetch_html(client: httpx.AsyncClient, url: str, timeout: int) -> Optional[str]:
     try:
         r = await client.get(url, headers=HEADERS, timeout=timeout, follow_redirects=True)
-        if r.status_code >= 400:
-            return None
+        r.raise_for_status()
         return r.text
     except Exception:
         return None
 
 def extract_main_text(html: str, url: Optional[str] = None, fallback_readability: bool = True) -> Dict[str, Any]:
-    # Try trafilatura first
-    downloaded = html
-    text = trafilatura.extract(downloaded, include_links=False, include_images=False, url=url, with_metadata=True)
-    if text:
-        data = trafilatura.extract(downloaded, include_formatting=False, url=url, output="json")
-        if data:
-            return orjson.loads(data)
+    try:
+        data_str = trafilatura.extract(html, url=url, output_format='json')
+        if data_str:
+            return orjson.loads(data_str)
+    except Exception:
+        pass # Fallback
 
-    # Fallback: readability
     if fallback_readability:
         try:
             from readability import Document
@@ -131,45 +122,22 @@ def extract_main_text(html: str, url: Optional[str] = None, fallback_readability
             content_html = doc.summary()
             soup = BeautifulSoup(content_html, "lxml")
             txt = clean_text(soup.get_text(separator=" "))
-            return {
-                "title": title,
-                "text": txt,
-                "url": url,
-                "language": None,
-                "authors": [],
-                "published": None
-            }
+            return {"title": title, "text": txt, "url": url}
         except Exception:
             pass
 
-    # Nothing worked
     return {"title": None, "text": None, "url": url}
 
 async def get_snippet(html: str) -> Dict[str, Optional[str]]:
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else None
     desc = None
-    m = soup.find("meta", {"name": "description"})
-    if m and m.get("content"):
-        desc = m["content"].strip()
-    og = soup.find("meta", {"property": "og:description"})
-    if not desc and og and og.get("content"):
-        desc = og["content"].strip()
+    if m := soup.find("meta", {"name": "description"}): desc = m.get("content")
+    if not desc and (og := soup.find("meta", {"property": "og:description"})): desc = og.get("content")
     return {"title": clean_text(title), "description": clean_text(desc)}
 
-def add_site_filter(q: str, site: Optional[str]) -> str:
-    if site:
-        return f"site:{site} {q}"
-    return q
-
-def add_time_filter(q: str, tbs: Optional[str]) -> str:
-    # googlesearch-python does not expose tbs directly
-    # we keep q same and let client add context words if needed
-    return q
-
 def dedupe_urls(urls: List[str]) -> List[str]:
-    seen = set()
-    out = []
+    seen, out = set(), []
     for u in urls:
         key = re.sub(r"#.*$", "", u.strip())
         if key not in seen:
@@ -178,18 +146,31 @@ def dedupe_urls(urls: List[str]) -> List[str]:
     return out
 
 # ----------------------------
-# Endpoints
+# API Endpoints
 # ----------------------------
+@app.get("/")
+def root():
+    return {
+        "name": "LLM Web Search API",
+        "version": "1.0.1",
+        "docs": "/docs",
+        "endpoints": ["/search", "/extract", "/batch_extract", "/yt/subtitles", "/health"]
+    }
+
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": time.time()}
+    return {"status": "ok", "timestamp": time.time()}
 
 @app.post("/search")
 @limiter.limit(settings.RATE_LIMIT)
-async def api_search(request: Request, params: SearchParams):
-    q = add_time_filter(add_site_filter(params.q, params.site), params.tbs)
-
-    urls = list(gsearch(q, num_results=params.num, lang=params.lang, region=params.country or ""))
+async def api_search(request: Request, params: SearchParams): # ✅ FIX: Added request: Request
+    query = f"site:{params.site} {params.q}" if params.site else params.q
+    
+    # googlesearch is blocking, run in executor to not block the event loop
+    loop = asyncio.get_event_loop()
+    urls = await loop.run_in_executor(
+        None, lambda: list(gsearch(query, num_results=params.num, lang=params.lang, stop=params.num))
+    )
 
     if params.dedupe:
         urls = dedupe_urls(urls)
@@ -199,34 +180,23 @@ async def api_search(request: Request, params: SearchParams):
     if params.fetch_snippets and urls:
         async with httpx.AsyncClient(headers=HEADERS) as client:
             sem = asyncio.Semaphore(params.parallel)
-
             async def worker(u: str):
                 async with sem:
                     html = await fetch_html(client, u, settings.TIMEOUT)
-                    if not html:
-                        return {"title": None, "description": None}
-                    return await get_snippet(html)
-
+                    return await get_snippet(html) if html else {"title": None, "description": None}
             tasks = [worker(u) for u in urls]
-            infos = await asyncio.gather(*tasks, return_exceptions=True)
+            infos = await asyncio.gather(*tasks)
 
         for i, info in enumerate(infos):
-            if isinstance(info, Exception):
-                info = {"title": None, "description": None}
             out[i].update(info)
 
     return orjson.loads(json_dumps({
-        "query": params.q,
-        "lang": params.lang,
-        "country": params.country,
-        "count": len(out),
-        "results": out
+        "query": params.q, "count": len(out), "results": out
     }))
-
 
 @app.post("/extract")
 @limiter.limit(settings.RATE_LIMIT)
-async def api_extract(request: Request, params: ExtractParams):
+async def api_extract(request: Request, p: ExtractParams): # ✅ FIX: Added request: Request
     async with httpx.AsyncClient(headers=HEADERS) as client:
         html = await fetch_html(client, p.url, p.timeout)
     if not html:
@@ -237,82 +207,49 @@ async def api_extract(request: Request, params: ExtractParams):
         raise HTTPException(status_code=422, detail="Could not extract clean text")
 
     res = {
-        "url": p.url,
-        "title": data.get("title"),
-        "text": data.get("text"),
-        "metadata": {
-            "language": data.get("language"),
-            "authors": data.get("authors"),
-            "published": data.get("date") or data.get("published")
-        } if p.with_metadata else None,
+        "url": p.url, "title": data.get("title"), "text": data.get("text"),
+        "metadata": { "language": data.get("language"), "authors": data.get("authors"), "published": data.get("date") or data.get("published") } if p.with_metadata else None,
         "chars": len(data.get("text") or ""),
     }
-    if p.include_html:
-        res["html"] = html
+    if p.include_html: res["html"] = html
     return orjson.loads(json_dumps(res))
 
 @app.post("/batch_extract")
 @limiter.limit(settings.RATE_LIMIT)
-async def api_batch_extract(p: BatchExtractParams):
+async def api_batch_extract(request: Request, p: BatchExtractParams): # ✅ FIX: Added request: Request
     async with httpx.AsyncClient(headers=HEADERS) as client:
         sem = asyncio.Semaphore(p.parallel)
         async def worker(u: str):
             async with sem:
                 html = await fetch_html(client, u, p.timeout)
-                if not html:
-                    return {"url": u, "ok": False, "error": "fetch_failed"}
+                if not html: return {"url": u, "ok": False, "error": "fetch_failed"}
                 data = extract_main_text(html, u)
-                if not data.get("text"):
-                    return {"url": u, "ok": False, "error": "extract_failed"}
-                return {
-                    "url": u, "ok": True,
-                    "title": data.get("title"),
-                    "text": data.get("text"),
-                    "chars": len(data.get("text") or "")
-                }
+                if not data.get("text"): return {"url": u, "ok": False, "error": "extract_failed"}
+                return { "url": u, "ok": True, "title": data.get("title"), "text": data.get("text"), "chars": len(data.get("text") or "")}
         results = await asyncio.gather(*[worker(u) for u in p.urls])
     return orjson.loads(json_dumps({"count": len(results), "items": results}))
 
 def _yt_id_from_url(maybe_url: str) -> str:
-    # handle full URL or id
-    m = re.search(r"(?:v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{6,})", maybe_url)
-    return m.group(1) if m else maybe_url
+    if m := re.search(r"(?:v=|/embed/|youtu\.be/|/v/|/e/|watch\?v=|\?v=|\&v=)([^#\&\?]{11})", maybe_url):
+        return m.group(1)
+    return maybe_url
 
 @app.post("/yt/subtitles")
 @limiter.limit(settings.RATE_LIMIT)
-def yt_subtitles(p: YTParams):
+def yt_subtitles(request: Request, p: YTParams): # ✅ FIX: Added request: Request
     vid = _yt_id_from_url(p.video_id)
     try:
         if p.translate_to:
-            transcripts = YouTubeTranscriptApi.list_transcripts(vid)
-            tr = transcripts.find_transcript(p.languages)
-            tr = tr.translate(p.translate_to)
+            tr = YouTubeTranscriptApi.list_transcripts(vid).find_transcript(p.languages).translate(p.translate_to)
             items = tr.fetch()
         else:
             items = YouTubeTranscriptApi.get_transcript(vid, languages=p.languages)
-    except TranscriptsDisabled:
-        raise HTTPException(status_code=403, detail="Subtitles disabled")
-    except NoTranscriptFound:
-        raise HTTPException(status_code=404, detail="No transcript found")
-    except VideoUnavailable:
-        raise HTTPException(status_code=404, detail="Video not available")
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"YT error: {e}")
+        raise HTTPException(status_code=500, detail=f"YouTube API error: {e}")
 
-    # pack for LLMs
     full_text = " ".join([x["text"] for x in items if x.get("text")])
     return orjson.loads(json_dumps({
-        "video_id": vid,
-        "segments": items,
-        "text": full_text,
-        "chars": len(full_text)
+        "video_id": vid, "segments": items, "text": full_text, "chars": len(full_text)
     }))
-
-# Root helper
-@app.get("/")
-def root():
-    return {
-        "name": "LLM Web Search API",
-        "version": "1.0.0",
-        "endpoints": ["/search", "/extract", "/batch_extract", "/yt/subtitles", "/health"]
-    }
