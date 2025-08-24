@@ -226,7 +226,7 @@ async def api_search(request: Request, params: SearchParams):
 
 @app.post("/extract")
 @limiter.limit(settings.RATE_LIMIT)
-async def api_extract(p: ExtractParams):
+async def api_extract(request: Request, params: ExtractParams):
     async with httpx.AsyncClient(headers=HEADERS) as client:
         html = await fetch_html(client, p.url, p.timeout)
     if not html:
