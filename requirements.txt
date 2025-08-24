@@ -1,4 +1,13 @@
 fastapi
-uvicorn
-requests
+uvicorn[standard]
+googlesearch-python
+httpx
+trafilatura
+readability-lxml
 beautifulsoup4
+lxml
+python-multipart
+pydantic-settings
+youtube-transcript-api
+orjson
+slowapi
