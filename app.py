@@ -186,10 +186,9 @@ def health():
 
 @app.post("/search")
 @limiter.limit(settings.RATE_LIMIT)
-async def api_search(params: SearchParams):
+async def api_search(request: Request, params: SearchParams):
     q = add_time_filter(add_site_filter(params.q, params.site), params.tbs)
 
-    # googlesearch-python returns URLs only
     urls = list(gsearch(q, num_results=params.num, lang=params.lang, region=params.country or ""))
 
     if params.dedupe:
@@ -200,12 +199,14 @@ async def api_search(params: SearchParams):
     if params.fetch_snippets and urls:
         async with httpx.AsyncClient(headers=HEADERS) as client:
             sem = asyncio.Semaphore(params.parallel)
+
             async def worker(u: str):
                 async with sem:
                     html = await fetch_html(client, u, settings.TIMEOUT)
                     if not html:
                         return {"title": None, "description": None}
                     return await get_snippet(html)
+
             tasks = [worker(u) for u in urls]
             infos = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -214,17 +215,6 @@ async def api_search(params: SearchParams):
                 info = {"title": None, "description": None}
             out[i].update(info)
 
-    # add sitemap hints for LLM crawl planning
-    if settings.ENABLE_SITEMAP:
-        for item in out:
-            try:
-                dom = re.sub(r"^https?://", "", item["url"]).split("/")[0]
-                sm = sitemap_search("https://" + dom)
-                if sm:
-                    item["sitemap"] = sm[:3]
-            except Exception:
-                item["sitemap"] = None
-
     return orjson.loads(json_dumps({
         "query": params.q,
         "lang": params.lang,
@@ -232,6 +222,7 @@ async def api_search(params: SearchParams):
         "count": len(out),
         "results": out
     }))
+
 
 @app.post("/extract")
 @limiter.limit(settings.RATE_LIMIT)
