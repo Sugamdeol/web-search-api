@@ -27,7 +27,7 @@ settings = Settings()
 
 # App & Middleware
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="LLM Web Search API", version="1.0.6-stable")
+app = FastAPI(title="LLM Web Search API", version="1.0.8-autocaption-fix")
 app.state.limiter = limiter
 
 app.add_middleware(
@@ -56,9 +56,7 @@ class YTParams(BaseModel):
     languages: List[str] = Field(default_factory=lambda: ["en", "en-US"])
 
 # Helper Functions
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
 async def fetch_html(client: httpx.AsyncClient, url: str):
     try:
         r = await client.get(url, headers=HEADERS, timeout=settings.TIMEOUT, follow_redirects=True)
@@ -80,21 +78,15 @@ def _yt_id_from_url(url_or_id: str):
 
 # API Endpoints
 @app.get("/")
-def root():
-    return {"message": "API is running. Visit /docs for documentation."}
+def root(): return {"message": "API is running. Visit /docs for documentation."}
 
 @app.post("/search")
 @limiter.limit(settings.RATE_LIMIT)
 async def api_search(request: Request, params: SearchParams):
     try:
         loop = asyncio.get_event_loop()
-        # ✅ FIX: Removed the unsupported 'stop' argument. 'num_results' is the correct one.
-        urls = await loop.run_in_executor(
-            None,
-            lambda: list(gsearch(params.q, num_results=params.num, lang='en'))
-        )
+        urls = await loop.run_in_executor(None, lambda: list(gsearch(params.q, num_results=params.num, lang='en')))
         if not urls: return {"query": params.q, "count": 0, "results": [], "warning": "No results found or request was blocked by Google."}
-        
         results = [{"url": u} for u in urls]
         if params.fetch_snippets:
             async with httpx.AsyncClient() as client:
@@ -102,7 +94,6 @@ async def api_search(request: Request, params: SearchParams):
                 html_contents = await asyncio.gather(*tasks)
                 for i, html in enumerate(html_contents):
                     if html: results[i].update(await get_snippet(html))
-        
         return {"query": params.q, "count": len(results), "results": results}
     except Exception as e:
         print(f"ERROR in /search: {e}")
@@ -125,12 +116,32 @@ async def api_extract(request: Request, params: ExtractParams):
 def yt_subtitles(request: Request, p: YTParams):
     try:
         vid = _yt_id_from_url(p.video_id)
-        # This code is correct, the problem is an old library version on Render
         transcript_list = YouTubeTranscriptApi.list_transcripts(vid)
-        transcript = transcript_list.find_transcript(p.languages)
+        
+        transcript = None
+        is_generated = False
+        try:
+            # First, try to find a manually created transcript
+            transcript = transcript_list.find_transcript(p.languages)
+        except NoTranscriptFound:
+            # If that fails, try to find an auto-generated transcript
+            try:
+                transcript = transcript_list.find_generated_transcript(p.languages)
+                is_generated = True
+            except NoTranscriptFound:
+                # If both fail, then there are no subtitles
+                raise NoTranscriptFound("No manual or auto-generated subtitles found for the given languages.")
+        
         items = transcript.fetch()
         full_text = " ".join([item["text"].replace('\n', ' ') for item in items])
-        return {"video_id": vid, "language_code": transcript.language_code, "text": full_text, "segments": items}
+        
+        return {
+            "video_id": vid, 
+            "language_code": transcript.language_code, 
+            "is_generated": is_generated,
+            "text": full_text, 
+            "segments": items
+        }
     except (TranscriptsDisabled, NoTranscriptFound) as e:
         raise HTTPException(status_code=404, detail=f"Could not find subtitles. Reason: {str(e)}")
     except Exception as e:
